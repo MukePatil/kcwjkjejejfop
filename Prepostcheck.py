@@ -10,10 +10,15 @@ with run metadata.
 
 Precheck/postcheck filenames do NOT need to match exactly — only the
 device identifier (FQDN or IP) embedded in the filename needs to be the
-same. Trailing capture timestamps are stripped automatically, so e.g.:
+same. Everything else in the name (parentheses, "-pre"/"-post"/
+"precheck"/"postcheck" markers, capture timestamps, extensions) is
+ignored automatically, so e.g.:
+    (lcaschc403.ntwk.kp.org)-pre
+    (lcaschc403.ntwk.kp.org)-post
+and:
     192.168.50.212__20260630_110428   (precheck)
     192.168.50.212__20260630_093027   (postcheck)
-are paired as the same device instead of being skipped/mismatched.
+are each paired as the same device instead of being skipped/mismatched.
 
 Run on a machine with access to PRE_DIR / POST_DIR (edit the paths below,
 or override everything from the command line — run with --help):
@@ -204,13 +209,73 @@ SH_VERSION_RE = re.compile(
 # HELPERS — generic
 # =====================================================
 
-def is_allowed_command(command):
-    """Return True if `command` matches (or starts with) an allowlisted command."""
+# A handful of very common Cisco-style abbreviations that don't reduce to
+# a clean word-prefix of their canonical COMPARE_COMMANDS entry (so the
+# generic abbreviation matching in canonical_command() below can't catch
+# them on its own), e.g. "show run" vs "show running-config" — "run" is
+# not followed by a space in "running-config". Extend this table if your
+# devices/engineers commonly type other short forms.
+_COMMAND_ALIASES = {
+    "show run": "show running-config",
+    "sh run": "show running-config",
+    "show ver": "show version",
+    "sh ver": "show version",
+    "show inv": "show inventory",
+    "sh inv": "show inventory",
+}
+
+
+def canonical_command(command):
+    """
+    Resolve `command` (as typed/captured in a log) to the single
+    COMPARE_COMMANDS entry it refers to, or return None if it doesn't
+    match any allowlisted command.
+
+    This is what lets precheck and postcheck logs use DIFFERENT phrasing
+    for the same logical command and still be compared against each
+    other instead of being treated as two unrelated commands, e.g.:
+        "show vlan brief"  (precheck)
+        "show vlan"        (postcheck)
+    both resolve to the same canonical key ("show vlan brief") instead
+    of creating two separate, unmatched dictionary entries — which is
+    what previously caused every VLAN to be reported as "missing from
+    postcheck" any time the two sides simply used different command text.
+
+    Two directions are handled:
+      1. `command` IS the canonical command, or an extension of it
+         (e.g. "show running-config all" -> "show running-config").
+      2. `command` is a SHORTER/abbreviated form of the canonical
+         command (e.g. "show vlan" -> "show vlan brief"). This is only
+         accepted when it is unambiguous — i.e. it is a word-boundary
+         prefix of exactly ONE canonical command. A vague fragment like
+         "show ip" matches several canonical commands ("show ip
+         interface brief", "show ip route", "show ip ospf neighbor",
+         "show ip bgp summary") and is deliberately left unmatched
+         rather than guessing.
+    """
     c = command.strip().lower()
+
+    if c in _COMMAND_ALIASES:
+        return _COMMAND_ALIASES[c]
+
+    # Direction 1: command is the canonical form, or extends it.
     for allowed in _COMPARE_COMMANDS_NORM:
         if c == allowed or c.startswith(allowed + " "):
-            return True
-    return False
+            return allowed
+
+    # Direction 2: command is a shorter/abbreviated form of a canonical
+    # command — only accepted if it's an unambiguous match.
+    matches = [allowed for allowed in _COMPARE_COMMANDS_NORM
+               if allowed.startswith(c + " ")]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def is_allowed_command(command):
+    """Return True if `command` matches (or starts with, or abbreviates)
+    an allowlisted command."""
+    return canonical_command(command) is not None
 
 
 def cmd_is(command, target):
@@ -258,9 +323,18 @@ def dedupe_preserve_order(items):
 # =====================================================
 # FILENAME -> DEVICE KEY NORMALIZATION
 # =====================================================
-# Precheck/postcheck filenames do NOT need to match exactly. Only the
-# device identifier (FQDN or IP) embedded in the filename needs to line
-# up. A trailing capture timestamp is stripped before comparing, so:
+# Precheck/postcheck filenames do NOT need to match at all beyond
+# sharing the same device identifier (FQDN or IP) somewhere in the
+# name. Everything else in the filename -- parentheses, "-pre"/"-post"/
+# "precheck"/"postcheck" markers, capture timestamps, run numbers, file
+# extensions -- is ignored automatically. For example, all of these
+# resolve to the SAME device key:
+#
+#   (lcaschc403.ntwk.kp.org)-pre
+#   (lcaschc403.ntwk.kp.org)-post
+#   lcaschc403.ntwk.kp.org_postcheck_20260630_110428.txt
+#
+# and:
 #
 #   192.168.50.212__20260630_110428   (precheck)
 #   192.168.50.212__20260630_093027   (postcheck)
@@ -268,8 +342,9 @@ def dedupe_preserve_order(items):
 # are correctly treated as the SAME device even though the timestamp
 # suffix is different.
 
-# Strips a small set of common log-file extensions (IPs contain dots too,
-# so we can't just use Path.suffix — that would chew off part of an IP).
+# Strips a small set of common log-file extensions (IPs/FQDNs contain
+# dots too, so we can't just use Path.suffix — that would chew off part
+# of an identifier).
 _KNOWN_LOG_EXTENSIONS_RE = re.compile(r"\.(log|txt|cfg|out)$", re.IGNORECASE)
 
 # Strips a trailing timestamp block: an 8-digit date (YYYYMMDD) optionally
@@ -279,21 +354,94 @@ _FILENAME_TIMESTAMP_RE = re.compile(
     r"[_\-\.\s]+\d{8}[_\-\.\s]?\d{6}?[_\-\.\s]*$"
 )
 
+# Strips a leading/trailing "pre"/"post"/"precheck"/"postcheck"/"before"/
+# "after" marker (whole word only — so a hostname that merely CONTAINS
+# "pre"/"post" as a substring, e.g. "PRESTON01", is never touched). Used
+# both as a fallback for dot-less hostnames and to trim a stray
+# ".pre"/".post" label that an FQDN-shaped match might have picked up.
+# NOTE: same explicit-boundary reasoning as the IPv4/FQDN regexes above
+# — \b treats '_' as a word character, so "SW01_pre" would not count
+# "pre" as a separate word under \b. (?<![A-Za-z0-9]) / (?![A-Za-z0-9])
+# correctly treat '_' (and '-', '.', whitespace) as separators.
+_PRE_POST_MARKER_RE = re.compile(
+    r"^[_\-\.\s]*(?<![A-Za-z0-9])(?:pre|post|precheck|postcheck|before|after)(?![A-Za-z0-9])[_\-\.\s]*"
+    r"|[_\-\.\s]*(?<![A-Za-z0-9])(?:pre|post|precheck|postcheck|before|after)(?![A-Za-z0-9])[_\-\.\s]*$",
+    re.IGNORECASE
+)
+
+# Matches an IPv4 address anywhere in the filename. Checked first — an
+# IP is unambiguous and needs no further cleanup.
+# NOTE: uses explicit (?<![A-Za-z0-9]) / (?![A-Za-z0-9]) boundaries
+# instead of \b — \b treats '_' as a "word" character, which would
+# otherwise truncate the match right before an underscore-joined
+# timestamp (e.g. "192.168.50.212__20260630" would wrongly stop at
+# "192.168.50").
+_FQDN_FILENAME_IPV4_RE = re.compile(
+    r"(?<![A-Za-z0-9])(\d{1,3}(?:\.\d{1,3}){3})(?![A-Za-z0-9])"
+)
+
+# Matches an FQDN-shaped token: dot-separated hostname labels
+# (letters/digits/hyphens), requiring at least one dot (2+ labels), e.g.
+# "lcaschc403.ntwk.kp.org". Deliberately excludes '(' ')' '_' whitespace
+# etc., so surrounding punctuation / "-pre" / "-post" / timestamp text
+# simply falls outside the match instead of needing its own strip rule.
+# Same explicit-boundary reasoning as the IPv4 regex above.
+_FQDN_FILENAME_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9])[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+(?![A-Za-z0-9])"
+)
+
 
 def device_key_from_filename(filename):
     """
-    Derive a canonical device identifier (FQDN or IP) from a log filename
-    by stripping known file extensions and any trailing capture timestamp.
-    Repeats the strip in case of stacked suffixes (e.g. extension AND
-    timestamp, or a timestamp appended twice).
+    Derive a canonical device identifier (FQDN or IP) from a log
+    filename, ignoring everything else in the name.
+
+    Order of operations:
+      1. Strip a known trailing file extension (repeatable, in case of
+         stacked suffixes).
+      2. If an IPv4 address appears anywhere in the name, use it — it's
+         unambiguous.
+      3. Otherwise look for an FQDN-shaped token (dot-separated labels)
+         anywhere in the name and take the LONGEST match, so a real
+         multi-label FQDN wins over an incidental look-alike such as a
+         leftover "pre.log". Any trailing ".pre"/".post"/etc. label the
+         match happened to pick up is trimmed off afterward.
+      4. If neither an IP nor an FQDN token is found (a bare hostname
+         with no dots at all), fall back to stripping a trailing
+         capture timestamp and a leading/trailing
+         "pre"/"post"/"precheck"/"postcheck" marker, then use whatever
+         text is left.
+
+    Case is not treated as significant (the key is upper-cased), so
+    "lcaschc403.ntwk.kp.org" and "LCASCHC403.NTWK.KP.ORG" pair up.
     """
     name = filename.strip()
+
     prev = None
     while prev != name:
         prev = name
         name = _KNOWN_LOG_EXTENSIONS_RE.sub("", name)
+
+    ip_match = _FQDN_FILENAME_IPV4_RE.search(name)
+    if ip_match:
+        return ip_match.group(1)
+
+    candidates = _FQDN_FILENAME_TOKEN_RE.findall(name)
+    if candidates:
+        best = max(candidates, key=len)
+        best = _PRE_POST_MARKER_RE.sub("", best).strip("_-. ")
+        if best:
+            return best.upper()
+
+    # Fallback: no FQDN/IP found anywhere — bare hostname with no dots.
+    # Strip timestamp + pre/post marker + stray punctuation/parentheses.
+    prev = None
+    while prev != name:
+        prev = name
         name = _FILENAME_TIMESTAMP_RE.sub("", name)
-    name = name.strip("_-. ")
+        name = _PRE_POST_MARKER_RE.sub("", name)
+    name = name.strip("_-. ()")
     return name.upper()
 
 
@@ -363,7 +511,16 @@ def ospf_issues(pre_lines, post_lines):
         if nid not in post_n:
             issues.append(f"{nid} (neighbor lost)")
     for nid, state in post_n.items():
-        if any(b in state.upper() for b in BAD_OSPF_STATES):
+        if not any(b in state.upper() for b in BAD_OSPF_STATES):
+            continue
+        # Skip neighbors that were ALREADY in a bad state pre-change —
+        # that's a pre-existing condition, not something this change
+        # caused, so don't re-flag it every run.
+        pre_state = pre_n.get(nid)
+        pre_was_bad = pre_state is not None and any(
+            b in pre_state.upper() for b in BAD_OSPF_STATES
+        )
+        if not pre_was_bad:
             issues.append(f"{nid} (state: {state})")
     return issues
 
@@ -405,12 +562,62 @@ def vlan_issues(pre_lines, post_lines):
         if vid not in post_v:
             issues.append(f"VLAN {vid} ({name}) missing from postcheck")
     for vid, (name, status) in post_v.items():
-        if any(b in status.upper() for b in BAD_VLAN_STATUS):
+        if not any(b in status.upper() for b in BAD_VLAN_STATUS):
+            continue
+        # Skip VLANs that were ALREADY bad pre-change — pre-existing
+        # condition, not caused by this change, so don't re-flag it.
+        pre_entry = pre_v.get(vid)
+        pre_was_bad = pre_entry is not None and any(
+            b in pre_entry[1].upper() for b in BAD_VLAN_STATUS
+        )
+        if not pre_was_bad:
             issues.append(f"VLAN {vid} ({name}) status: {status}")
     return issues
 
 
-def extract_bgp_neighbors(lines):
+def extract_interface_status(lines):
+    """
+    {interface_name: (full_line, is_critical)} built from any line that
+    starts with an interface-shaped token (Gi1/0/12, Te1/1/1, Vl100,
+    ...). Used to compare an interface's state PRE vs POST by identity
+    rather than by raw line position, so a reordered line doesn't look
+    like a change and — more importantly — so we know what that same
+    interface's state was on the other side of the change window.
+    """
+    status = {}
+    for line in lines:
+        iface = extract_interface_name(line)
+        if not iface:
+            continue
+        status[iface] = (line, line_is_critical(line))
+    return status
+
+
+def interface_down_transitions(pre_lines, post_lines):
+    """
+    Return the interface names that went from a healthy (non-critical)
+    or absent state in the precheck to a critical/down state in the
+    postcheck -- i.e. an actual UP -> DOWN transition.
+
+    An interface that was ALREADY down/critical in the precheck and is
+    still down/critical in the postcheck is deliberately EXCLUDED: that
+    is a pre-existing condition the maintenance window didn't cause, so
+    it shouldn't be raised as a new "down interface" alert every time
+    a counter or timestamp on that same line ticks over.
+    """
+    pre_status = extract_interface_status(pre_lines)
+    post_status = extract_interface_status(post_lines)
+    transitioned = []
+    for iface, (_post_line, post_crit) in post_status.items():
+        if not post_crit:
+            continue
+        pre_entry = pre_status.get(iface)
+        pre_crit = pre_entry[1] if pre_entry else False
+        if not pre_crit:
+            transitioned.append(iface)
+    return transitioned
+
+
     """{neighbor_ip: state_or_pfxrcd}"""
     neighbors = {}
     for line in lines:
@@ -431,7 +638,13 @@ def bgp_issues(pre_lines, post_lines):
         # A numeric State/PfxRcd column means the session is up and
         # exchanging prefixes; anything else (Idle, Active, Connect, ...)
         # means the session is down.
-        if not state.replace(".", "").isdigit():
+        if state.replace(".", "").isdigit():
+            continue
+        # Skip sessions that were ALREADY down pre-change — pre-existing
+        # condition, not caused by this change, so don't re-flag it.
+        pre_state = pre_b.get(nid)
+        pre_was_down = pre_state is not None and not pre_state.replace(".", "").isdigit()
+        if not pre_was_down:
             issues.append(f"{nid} (state: {state})")
     return issues
 
@@ -461,6 +674,14 @@ def parse_log(filename):
     Parse a single log file into: { DEVICE_NAME: { command: [output lines] } }
     Only allowlisted commands are retained — everything else is dropped as
     it is parsed, so it never touches memory beyond the current line.
+
+    Output is stored under the CANONICAL command name (see
+    canonical_command()), not the raw text typed at the prompt. This is
+    what lets "show vlan brief" (precheck) and "show vlan" (postcheck) —
+    or "show running-config" vs "show running-config all", etc. — land
+    in the same bucket and get diffed against each other, instead of
+    being treated as two unrelated commands (which previously made
+    every VLAN/route/etc. on one side look "missing" from the other).
     """
     devices = {}
     device = "UNKNOWN"
@@ -476,13 +697,14 @@ def parse_log(filename):
                 device = match.group(1).strip().upper()
 
                 if "#" in line:
-                    command = line.split("#", 1)[1].strip()
+                    typed_command = line.split("#", 1)[1].strip()
                 elif ">" in line:
-                    command = line.split(">", 1)[1].strip()
+                    typed_command = line.split(">", 1)[1].strip()
                 else:
-                    command = line.strip()
+                    typed_command = line.strip()
 
-                command_allowed = is_allowed_command(command)
+                command = canonical_command(typed_command)
+                command_allowed = command is not None
 
                 if command_allowed:
                     devices.setdefault(device, {})
@@ -539,11 +761,22 @@ def parse_and_merge_all(paths, workers):
 # DIFF RENDERING
 # =====================================================
 
-def diff_opcodes_html(pre_lines, post_lines, cmd_id):
+def diff_opcodes_html(pre_lines, post_lines, cmd_id, transitioned_interfaces=None):
     """
     Build the side-by-side diff table body for one command.
     Returns (body_html, hidden_html, changed_bool, critical_bool, down_interfaces_list).
     Equal (unchanged) runs are rendered but collapsed by default.
+
+    transitioned_interfaces: for INTERFACE_STATUS_COMMANDS, the caller
+    pre-computes (via interface_down_transitions()) the set of
+    interfaces that genuinely went UP -> DOWN between pre and post.
+    When this is provided, a critical-looking line only counts toward
+    `critical`/`down_interfaces` if its interface is in that set — an
+    interface that was already down pre-change and is still down
+    post-change (e.g. only a byte counter in the line changed) is
+    rendered as a normal modification, not flagged as a new outage.
+    Pass None (the default) to keep the old behavior for commands with
+    no interface concept, e.g. "show logging".
     """
     sm = difflib.SequenceMatcher(None, pre_lines, post_lines)
     rows_visible = []
@@ -551,6 +784,13 @@ def diff_opcodes_html(pre_lines, post_lines, cmd_id):
     changed = False
     critical = False
     down_interfaces = []
+
+    def _counts_as_down(line):
+        """True if this critical-looking line should actually be flagged."""
+        if transitioned_interfaces is None:
+            return True
+        iface = extract_interface_name(line)
+        return iface is not None and iface in transitioned_interfaces
 
     for tag, a, b, c, d in sm.get_opcodes():
         if tag == "equal":
@@ -564,7 +804,7 @@ def diff_opcodes_html(pre_lines, post_lines, cmd_id):
 
         if tag == "insert":
             for line in post_lines[c:d]:
-                is_crit = line_is_critical(line)
+                is_crit = line_is_critical(line) and _counts_as_down(line)
                 css = "diff-critical" if is_crit else "diff-added"
                 if is_crit:
                     critical = True
@@ -578,7 +818,7 @@ def diff_opcodes_html(pre_lines, post_lines, cmd_id):
 
         elif tag == "delete":
             for line in pre_lines[a:b]:
-                is_crit = line_is_critical(line)
+                is_crit = line_is_critical(line) and _counts_as_down(line)
                 css = "diff-critical" if is_crit else "diff-removed"
                 if is_crit:
                     critical = True
@@ -597,7 +837,7 @@ def diff_opcodes_html(pre_lines, post_lines, cmd_id):
             for i in range(length):
                 p = old[i] if i < len(old) else ""
                 q = new[i] if i < len(new) else ""
-                is_crit = line_is_critical(p) or line_is_critical(q)
+                is_crit = (line_is_critical(p) or line_is_critical(q)) and _counts_as_down(q or p)
                 css = "diff-critical" if is_crit else "diff-modified"
                 if is_crit:
                     critical = True
@@ -693,8 +933,12 @@ def build_device_section(device, pre_cmds, post_cmds, section_counter):
         section_counter[0] += 1
         cmd_id = f"unchg-{section_counter[0]}"
 
+        transitioned_interfaces = None
+        if cmd in INTERFACE_STATUS_COMMANDS:
+            transitioned_interfaces = set(interface_down_transitions(pre_lines, post_lines))
+
         body_html, hidden_html, changed, critical, down_ifaces = diff_opcodes_html(
-            pre_lines, post_lines, cmd_id
+            pre_lines, post_lines, cmd_id, transitioned_interfaces=transitioned_interfaces
         )
 
         if cmd in INTERFACE_STATUS_COMMANDS and down_ifaces:
